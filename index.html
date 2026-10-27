@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ephemeral 1-on-1 Link</title>
+  <style>
+    * { box-sizing: border-box; font-family: monospace; }
+    body { background: #0d1117; color: #c9d1d9; margin: 0; padding: 15px; display: flex; flex-direction: column; height: 100vh; }
+    h3 { margin: 0 0 10px 0; color: #58a6ff; }
+    .box { background: #161b22; border: 1px solid #30363d; padding: 12px; border-radius: 6px; margin-bottom: 10px; }
+    input, button { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 10px; border-radius: 4px; width: 100%; margin-top: 6px; }
+    button { background: #238636; color: #fff; font-weight: bold; cursor: pointer; border: none; }
+    button.danger { background: #da3633; }
+    button.secondary { background: #30363d; }
+    #chat-box { flex: 1; overflow-y: auto; background: #090d11; border: 1px solid #30363d; padding: 10px; border-radius: 6px; margin-bottom: 10px; }
+    .msg { margin-bottom: 6px; word-break: break-word; }
+    .msg.me { color: #58a6ff; }
+    .msg.peer { color: #3fb950; }
+    .msg.sys { color: #8b949e; font-style: italic; }
+    .row { display: flex; gap: 8px; }
+    .row input { flex: 1; margin-top: 0; }
+    .row button { width: auto; margin-top: 0; padding: 10px 16px; }
+  </style>
+</head>
+<body>
+
+  <!-- Setup Screen -->
+  <div id="setup-view" class="box">
+    <h3>Secret Room Connect</h3>
+    <input type="password" id="pin-input" placeholder="Server Access PIN (from HF Secrets)..." />
+    <input type="password" id="room-input" placeholder="Room Name (Shared with friend)..." />
+    <button onclick="joinRoom()">Authenticate & Start Audio</button>
+  </div>
+
+  <!-- Active Call & Chat Screen -->
+  <div id="call-view" style="display: none; flex-direction: column; height: 100%;">
+    <div class="box">
+      <div id="status">Status: Waiting for peer...</div>
+      <div class="row" style="margin-top: 8px;">
+        <button id="mute-btn" class="secondary" onclick="toggleMute()">Mute Mic</button>
+        <button class="danger" onclick="leaveRoom()">Disconnect / Wipe</button>
+      </div>
+    </div>
+
+    <div id="chat-box"></div>
+
+    <div class="row">
+      <input type="text" id="msg-input" placeholder="Type ephemeral message..." onkeydown="if(event.key==='Enter') sendMsg()" />
+      <button onclick="sendMsg()">Send</button>
+    </div>
+  </div>
+
+  <audio id="remote-audio" autoplay playsinline></audio>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    let pc = null;
+    let localStream = null;
+    let dataChannel = null;
+    let isMuted = false;
+
+    const statusEl = document.getElementById('status');
+    const chatBox = document.getElementById('chat-box');
+    const remoteAudio = document.getElementById('remote-audio');
+
+    function logMsg(text, type = 'sys') {
+      const div = document.createElement('div');
+      div.className = `msg ${type}`;
+      div.textContent = text;
+      chatBox.appendChild(div);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    async function joinRoom() {
+      const pin = document.getElementById('pin-input').value.trim();
+      const room = document.getElementById('room-input').value.trim();
+      if (!pin || !room) return alert("Enter both the Access PIN and a Room Name!");
+
+      try {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      } catch (err) {
+        return alert("Microphone access is required: " + err.message);
+      }
+
+      socket.emit('join', { room, pin });
+    }
+
+    socket.on('auth-error', (msg) => {
+      alert(msg);
+      if (localStream) localStream.getTracks().forEach(t => t.stop());
+    });
+
+    socket.on('joined', ({ iceServers }) => {
+      document.getElementById('setup-view').style.display = 'none';
+      document.getElementById('call-view').style.display = 'flex';
+      initPeerConnection(iceServers);
+      logMsg("Authenticated. Waiting for friend...");
+    });
+
+    function initPeerConnection(iceServers) {
+      pc = new RTCPeerConnection({ iceServers });
+
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+      pc.ontrack = (event) => {
+        remoteAudio.srcObject = event.streams[0];
+        statusEl.textContent = "Status: Encrypted Audio Connected!";
+        statusEl.style.color = "#3fb950";
+      };
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) {
+          socket.emit('signal', { candidate: event.candidate });
+        }
+      };
+
+      pc.onconnectionstatechange = () => {
+        statusEl.textContent = `Status: ${pc.connectionState}`;
+      };
+
+      pc.ondatachannel = (event) => {
+        setupDataChannel(event.channel);
+      };
+    }
+
+    function setupDataChannel(channel) {
+      dataChannel = channel;
+      dataChannel.onopen = () => logMsg("P2P Encrypted Chat Ready.");
+      dataChannel.onmessage = (e) => logMsg("Friend: " + e.data, 'peer');
+    }
+
+    socket.on('peer-joined', async () => {
+      logMsg("Friend detected! Negotiating encrypted link...");
+      const dc = pc.createDataChannel("chat");
+      setupDataChannel(dc);
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      socket.emit('signal', { sdp: pc.localDescription });
+    });
+
+    socket.on('signal', async (data) => {
+      if (!pc) return;
+      try {
+        if (data.sdp) {
+          await pc.setRemoteDescription(new RTCSessionDescription(data.sdp));
+          if (data.sdp.type === 'offer') {
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit('signal', { sdp: pc.localDescription });
+          }
+        } else if (data.candidate) {
+          await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    });
+
+    socket.on('peer-left', () => {
+      logMsg("Friend disconnected.");
+      statusEl.textContent = "Status: Peer Disconnected";
+      statusEl.style.color = "#da3633";
+    });
+
+    socket.on('full', () => {
+      alert("Room already has 2 people!");
+      location.reload();
+    });
+
+    function sendMsg() {
+      const input = document.getElementById('msg-input');
+      const text = input.value.trim();
+      if (!text || !dataChannel || dataChannel.readyState !== 'open') return;
+      dataChannel.send(text);
+      logMsg("Me: " + text, 'me');
+      input.value = '';
+    }
+
+    function toggleMute() {
+      if (!localStream) return;
+      isMuted = !isMuted;
+      localStream.getAudioTracks()[0].enabled = !isMuted;
+      document.getElementById('mute-btn').textContent = isMuted ? "Unmute Mic" : "Mute Mic";
+    }
+
+    function leaveRoom() {
+      location.reload();
+    }
+  </script>
+</body>
+</html>
